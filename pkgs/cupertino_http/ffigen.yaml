@@ -42,6 +42,8 @@ objc-interfaces:
     - 'NSURLSessionConfiguration'
     - 'NSURLSessionDownloadTask'
     - 'NSURLSessionTask'
+    - 'NSURLSessionTaskMetrics'
+    - 'NSURLSessionTaskTransactionMetrics'
     - 'NSURLSessionWebSocketMessage'
     - 'NSURLSessionWebSocketTask'
   member-rename:
