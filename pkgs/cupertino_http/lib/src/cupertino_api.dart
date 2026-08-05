@@ -31,6 +31,11 @@ import 'dart:async';
 import 'package:objective_c/objective_c.dart' as objc;
 
 import 'native_cupertino_bindings.dart' as ncb;
+// LOCAL PATCH (generation 2): show/export the two task-metrics enums,
+// following the same pattern already used for NSURLSessionTaskState — they
+// are returned from public getters below (URLSessionTaskTransactionMetrics
+// .domainResolutionProtocol / .resourceFetchType), so callers must be able
+// to name the type without importing native_cupertino_bindings.dart.
 import 'native_cupertino_bindings.dart'
     show
         NSHTTPCookieAcceptPolicy,
@@ -38,6 +43,8 @@ import 'native_cupertino_bindings.dart'
         NSURLRequestNetworkServiceType,
         NSURLSessionMultipathServiceType,
         NSURLSessionResponseDisposition,
+        NSURLSessionTaskMetricsDomainResolutionProtocol,
+        NSURLSessionTaskMetricsResourceFetchType,
         NSURLSessionTaskState,
         NSURLSessionWebSocketMessageType;
 
@@ -48,6 +55,8 @@ export 'native_cupertino_bindings.dart'
         NSURLRequestNetworkServiceType,
         NSURLSessionMultipathServiceType,
         NSURLSessionResponseDisposition,
+        NSURLSessionTaskMetricsDomainResolutionProtocol,
+        NSURLSessionTaskMetricsResourceFetchType,
         NSURLSessionTaskState,
         NSURLSessionWebSocketCloseCode,
         NSURLSessionWebSocketMessageType;
@@ -56,6 +65,21 @@ objc.NSURL _uriToNSURL(Uri uri) =>
     objc.NSURL.URLWithString(uri.toString().toNSString())!;
 Uri _nsurlToUri(objc.NSURL url) =>
     Uri.parse(url.absoluteString!.toDartString());
+
+// LOCAL PATCH (generation 2): convert a transaction metric's NSDate? phase
+// marker to a Dart DateTime?, matching this file's existing double-seconds
+// idiom for Duration conversions (see
+// URLSessionConfiguration.timeoutIntervalForRequest below). Microseconds,
+// not milliseconds, to avoid rounding error at both ends of a phase split.
+// UTC, not local time: these values are meant to be compared and logged
+// alongside timestamps from other sources (server logs, other devices), so
+// the instant must not depend on the reader's time zone.
+DateTime? _nsDateToDateTime(objc.NSDate? date) => date == null
+    ? null
+    : DateTime.fromMicrosecondsSinceEpoch(
+        (date.timeIntervalSince1970 * Duration.microsecondsPerSecond).round(),
+        isUtc: true,
+      );
 
 /// Callback for HTTP redirect handling.
 typedef OnRedirect =
@@ -86,6 +110,16 @@ typedef OnFinishedDownloading =
 typedef OnComplete =
     void Function(URLSession session, URLSessionTask task, objc.NSError? error);
 
+// LOCAL PATCH (generation 2): add the task-metrics callback typedef.
+/// Callback invoked once a task's [URLSessionTaskMetrics] have finished
+/// being collected.
+typedef OnMetrics =
+    void Function(
+      URLSession session,
+      URLSessionTask task,
+      URLSessionTaskMetrics metrics,
+    );
+
 /// Callback invoked when a WebSocket handshake succeeds.
 typedef OnWebSocketTaskOpened =
     void Function(
@@ -111,6 +145,9 @@ objc.ObjCProtocolBuilder _buildDelegate(
   OnData? onData,
   OnFinishedDownloading? onFinishedDownloading,
   OnComplete? onComplete,
+  // LOCAL PATCH (generation 2): thread onMetrics through, mirroring
+  // onComplete.
+  OnMetrics? onMetrics,
   OnWebSocketTaskOpened? onWebSocketTaskOpened,
   OnWebSocketTaskClosed? onWebSocketTaskClosed,
 }) {
@@ -123,6 +160,21 @@ objc.ObjCProtocolBuilder _buildDelegate(
             URLSession._(nsSession, isBackground: isBackground),
             URLSessionTask._(nsTask),
             nsError,
+          );
+        });
+  }
+
+  // LOCAL PATCH (generation 2): wire the task-metrics delegate callback.
+  // Same builder class and mechanism as onComplete above.
+  if (onMetrics != null) {
+    ncb
+        .NSURLSessionDataDelegate$Builder
+        .URLSession_task_didFinishCollectingMetrics_
+        .implementAsListener(protoBuilder, (nsSession, nsTask, nsMetrics) {
+          onMetrics(
+            URLSession._(nsSession, isBackground: isBackground),
+            URLSessionTask._(nsTask),
+            URLSessionTaskMetrics._(nsMetrics),
           );
         });
   }
@@ -750,6 +802,9 @@ class URLSessionTask extends _ObjectHolder<ncb.NSURLSessionTask> {
     OnData? onData,
     OnFinishedDownloading? onFinishedDownloading,
     OnComplete? onComplete,
+    // LOCAL PATCH (generation 2): thread onMetrics through, mirroring
+    // onComplete.
+    OnMetrics? onMetrics,
     OnWebSocketTaskOpened? onWebSocketTaskOpened,
     OnWebSocketTaskClosed? onWebSocketTaskClosed,
   }) {
@@ -760,6 +815,7 @@ class URLSessionTask extends _ObjectHolder<ncb.NSURLSessionTask> {
       onData: onData,
       onFinishedDownloading: onFinishedDownloading,
       onComplete: onComplete,
+      onMetrics: onMetrics,
       onWebSocketTaskOpened: onWebSocketTaskOpened,
       onWebSocketTaskClosed: onWebSocketTaskClosed,
     );
@@ -881,6 +937,243 @@ class URLSessionWebSocketTask extends URLSessionTask {
 
   @override
   String toString() => _toStringHelper('NSURLSessionWebSocketTask');
+}
+
+// LOCAL PATCH (generation 2): task-metrics wrapper classes. Generation 2
+// regenerated the bindings for NSURLSessionTaskMetrics and
+// NSURLSessionTaskTransactionMetrics; neither had a hand-written wrapper
+// before this — surfacing them is the reason this fork exists (see
+// PATCH.md, "Why we own it", reason 1).
+
+/// Per-task metrics collected by [URLSession] while executing a
+/// [URLSessionTask].
+///
+/// Delivered to [OnMetrics], generally around the same time [OnComplete]
+/// fires for the same task — the two callbacks are not ordered relative to
+/// each other.
+///
+/// See [NSURLSessionTaskMetrics](https://developer.apple.com/documentation/foundation/nsurlsessiontaskmetrics)
+class URLSessionTaskMetrics
+    extends _ObjectHolder<ncb.NSURLSessionTaskMetrics> {
+  URLSessionTaskMetrics._(super.c);
+
+  /// The metrics for every request/response transaction made while
+  /// executing the task, in the order they occurred.
+  ///
+  /// A task ordinarily produces one transaction. It produces more than one
+  /// when the request was redirected or the server issued an authentication
+  /// challenge — each such transaction gets its own entry here, so the
+  /// order tells the redirect/auth history apart from a single reused or
+  /// fresh connection.
+  List<URLSessionTaskTransactionMetrics> get transactionMetrics {
+    final metrics = _nsObject.transactionMetrics;
+    return List.generate(
+      metrics.count,
+      (i) => URLSessionTaskTransactionMetrics._(
+        ncb.NSURLSessionTaskTransactionMetrics.as(metrics.objectAtIndex(i)),
+      ),
+    );
+  }
+
+  /// The number of redirects recorded while executing the task.
+  int get redirectCount => _nsObject.redirectCount;
+
+  @override
+  String toString() =>
+      '[URLSessionTaskMetrics '
+      'transactionMetrics=$transactionMetrics '
+      'redirectCount=$redirectCount'
+      ']';
+}
+
+/// One request/response transaction's timing and connection metrics,
+/// collected while a [URLSessionTask] executed.
+///
+/// A task ordinarily has one of these; redirects and authentication
+/// challenges each add another — see
+/// [URLSessionTaskMetrics.transactionMetrics].
+///
+/// All phase-split dates on this class are UTC.
+///
+/// See [NSURLSessionTaskTransactionMetrics](https://developer.apple.com/documentation/foundation/nsurlsessiontasktransactionmetrics)
+class URLSessionTaskTransactionMetrics
+    extends _ObjectHolder<ncb.NSURLSessionTaskTransactionMetrics> {
+  URLSessionTaskTransactionMetrics._(super.c);
+
+  /// Whether this transaction reused a persistent connection from an
+  /// earlier transaction, rather than establishing a new one.
+  bool get isReusedConnection => _nsObject.isReusedConnection;
+
+  /// The time the user agent started fetching the resource, whether or not
+  /// it came from the server or from local resources.
+  ///
+  /// `null` under the same condition as [domainLookupStartDate].
+  DateTime? get fetchStartDate => _nsDateToDateTime(_nsObject.fetchStartDate);
+
+  /// The time immediately before the user agent started the DNS lookup for
+  /// the resource.
+  ///
+  /// `null` if a persistent connection was used or the resource came from
+  /// local resources — the same condition applies to
+  /// [domainLookupEndDate], [connectStartDate], [connectEndDate],
+  /// [secureConnectionStartDate], and [secureConnectionEndDate].
+  DateTime? get domainLookupStartDate =>
+      _nsDateToDateTime(_nsObject.domainLookupStartDate);
+
+  /// The time after the DNS lookup completed.
+  ///
+  /// `null` under the same condition as [domainLookupStartDate].
+  DateTime? get domainLookupEndDate =>
+      _nsDateToDateTime(_nsObject.domainLookupEndDate);
+
+  /// The time immediately before the user agent started establishing the
+  /// connection to the server — for example, immediately before starting
+  /// the TCP handshake.
+  ///
+  /// `null` under the same condition as [domainLookupStartDate].
+  DateTime? get connectStartDate =>
+      _nsDateToDateTime(_nsObject.connectStartDate);
+
+  /// The time immediately after the user agent finished establishing the
+  /// connection to the server, including completion of the security
+  /// handshake.
+  ///
+  /// `null` under the same condition as [domainLookupStartDate].
+  DateTime? get connectEndDate => _nsDateToDateTime(_nsObject.connectEndDate);
+
+  /// The time immediately before the user agent started the TLS handshake
+  /// to secure the connection.
+  ///
+  /// `null` if an encrypted connection was not used.
+  DateTime? get secureConnectionStartDate =>
+      _nsDateToDateTime(_nsObject.secureConnectionStartDate);
+
+  /// The time immediately after the TLS handshake completed.
+  ///
+  /// `null` if an encrypted connection was not used.
+  DateTime? get secureConnectionEndDate =>
+      _nsDateToDateTime(_nsObject.secureConnectionEndDate);
+
+  /// The time immediately before the user agent started requesting the
+  /// resource, whether or not it came from the server or from local
+  /// resources — for example, immediately before sending an HTTP GET.
+  DateTime? get requestStartDate =>
+      _nsDateToDateTime(_nsObject.requestStartDate);
+
+  /// The time immediately after the user agent finished requesting the
+  /// resource — for example, immediately after sending the last byte of the
+  /// request.
+  DateTime? get requestEndDate => _nsDateToDateTime(_nsObject.requestEndDate);
+
+  /// The time immediately after the user agent received the first byte of
+  /// the response, from the server or from local resources.
+  DateTime? get responseStartDate =>
+      _nsDateToDateTime(_nsObject.responseStartDate);
+
+  /// The time immediately after the user agent received the last byte of
+  /// the resource.
+  DateTime? get responseEndDate =>
+      _nsDateToDateTime(_nsObject.responseEndDate);
+
+  /// The TLS cipher suite negotiated for the connection.
+  ///
+  /// `null` if an encrypted connection was not used. Decode against
+  /// `tls_ciphersuite_t` in `Security/SecProtocolTypes.h`.
+  int? get negotiatedTLSCipherSuite =>
+      _nsObject.negotiatedTLSCipherSuite?.intValue;
+
+  /// The TLS protocol version negotiated for the connection.
+  ///
+  /// `null` if an encrypted connection was not used. Decode against
+  /// `tls_protocol_version_t` in `Security/SecProtocolTypes.h`.
+  int? get negotiatedTLSProtocolVersion =>
+      _nsObject.negotiatedTLSProtocolVersion?.intValue;
+
+  /// The network protocol used to fetch the resource, identified by its
+  /// ALPN protocol ID — for example `h2`, `h3`, or `http/1.1`.
+  String? get networkProtocolName =>
+      _nsObject.networkProtocolName?.toDartString();
+
+  /// The DNS protocol used to resolve the domain.
+  NSURLSessionTaskMetricsDomainResolutionProtocol
+  get domainResolutionProtocol => _nsObject.domainResolutionProtocol;
+
+  /// Whether the resource was loaded over the network, pushed by the
+  /// server, or served from the local cache.
+  NSURLSessionTaskMetricsResourceFetchType get resourceFetchType =>
+      _nsObject.resourceFetchType;
+
+  /// The size, in bytes, of the upload body — data, file, or stream —
+  /// before any content or transfer encoding.
+  int get countOfRequestBodyBytesBeforeEncoding =>
+      _nsObject.countOfRequestBodyBytesBeforeEncoding;
+
+  /// The number of bytes transferred for the request body, including
+  /// protocol framing, transfer encoding, and content encoding.
+  int get countOfRequestBodyBytesSent =>
+      _nsObject.countOfRequestBodyBytesSent;
+
+  /// The number of bytes transferred for the request header.
+  int get countOfRequestHeaderBytesSent =>
+      _nsObject.countOfRequestHeaderBytesSent;
+
+  /// The size, in bytes, of the response body delivered to the caller,
+  /// after decoding.
+  int get countOfResponseBodyBytesAfterDecoding =>
+      _nsObject.countOfResponseBodyBytesAfterDecoding;
+
+  /// The number of bytes transferred for the response body, including
+  /// protocol framing, transfer encoding, and content encoding.
+  int get countOfResponseBodyBytesReceived =>
+      _nsObject.countOfResponseBodyBytesReceived;
+
+  /// The number of bytes transferred for the response header.
+  int get countOfResponseHeaderBytesReceived =>
+      _nsObject.countOfResponseHeaderBytesReceived;
+
+  /// Whether a proxy connection was used to fetch the resource.
+  bool get isProxyConnection => _nsObject.isProxyConnection;
+
+  /// Whether the connection is established over a cellular interface.
+  bool get isCellular => _nsObject.isCellular;
+
+  /// Whether the connection is established over an interface the system
+  /// considers expensive — for example a personal hotspot.
+  bool get isExpensive => _nsObject.isExpensive;
+
+  /// Whether the connection is established over an interface marked
+  /// constrained — for example under Low Data Mode.
+  bool get isConstrained => _nsObject.isConstrained;
+
+  /// The IP address of the remote interface for the connection.
+  ///
+  /// `null` if a connection was not used.
+  String? get remoteAddress => _nsObject.remoteAddress?.toDartString();
+
+  /// The port of the remote interface for the connection.
+  ///
+  /// `null` if a connection was not used.
+  int? get remotePort => _nsObject.remotePort?.intValue;
+
+  /// The IP address of the local interface for the connection.
+  ///
+  /// `null` if a connection was not used.
+  String? get localAddress => _nsObject.localAddress?.toDartString();
+
+  /// The port of the local interface for the connection.
+  ///
+  /// `null` if a connection was not used.
+  int? get localPort => _nsObject.localPort?.intValue;
+
+  @override
+  String toString() =>
+      '[URLSessionTaskTransactionMetrics '
+      'isReusedConnection=$isReusedConnection '
+      'resourceFetchType=$resourceFetchType '
+      'networkProtocolName=$networkProtocolName '
+      'remoteAddress=$remoteAddress '
+      'remotePort=$remotePort'
+      ']';
 }
 
 /// A request to load a URL.
@@ -1038,6 +1331,9 @@ class URLSession extends _ObjectHolder<ncb.NSURLSession> {
     OnData? onData,
     OnFinishedDownloading? onFinishedDownloading,
     OnComplete? onComplete,
+    // LOCAL PATCH (generation 2): thread onMetrics through, mirroring
+    // onComplete.
+    OnMetrics? onMetrics,
     OnWebSocketTaskOpened? onWebSocketTaskOpened,
     OnWebSocketTaskClosed? onWebSocketTaskClosed,
   }) {
@@ -1048,6 +1344,7 @@ class URLSession extends _ObjectHolder<ncb.NSURLSession> {
       onData: onData,
       onFinishedDownloading: onFinishedDownloading,
       onComplete: onComplete,
+      onMetrics: onMetrics,
       onWebSocketTaskOpened: onWebSocketTaskOpened,
       onWebSocketTaskClosed: onWebSocketTaskClosed,
     );
@@ -1093,6 +1390,10 @@ class URLSession extends _ObjectHolder<ncb.NSURLSession> {
   /// `error` is `null` then the request completed successfully. See
   /// [URLSession:task:didCompleteWithError:](https://developer.apple.com/documentation/foundation/nsurlsessiontaskdelegate/1411610-urlsession)
   ///
+  /// If [onMetrics] is set then it will be called once a task's
+  /// [URLSessionTaskMetrics] have finished being collected. See
+  /// [URLSession:task:didFinishCollectingMetrics:](https://developer.apple.com/documentation/foundation/nsurlsessiontaskdelegate).
+  ///
   /// See [sessionWithConfiguration:delegate:delegateQueue:](https://developer.apple.com/documentation/foundation/nsurlsession/1411597-sessionwithconfiguration)
   ///
   /// If [onWebSocketTaskOpened] is set then it will be called when a
@@ -1110,6 +1411,9 @@ class URLSession extends _ObjectHolder<ncb.NSURLSession> {
     OnData? onData,
     OnFinishedDownloading? onFinishedDownloading,
     OnComplete? onComplete,
+    // LOCAL PATCH (generation 2): thread onMetrics through, mirroring
+    // onComplete.
+    OnMetrics? onMetrics,
     OnWebSocketTaskOpened? onWebSocketTaskOpened,
     OnWebSocketTaskClosed? onWebSocketTaskClosed,
   }) {
@@ -1126,6 +1430,7 @@ class URLSession extends _ObjectHolder<ncb.NSURLSession> {
             onData ??
             onFinishedDownloading ??
             onComplete ??
+            onMetrics ??
             onWebSocketTaskOpened ??
             onWebSocketTaskClosed) !=
         null;
@@ -1141,6 +1446,7 @@ class URLSession extends _ObjectHolder<ncb.NSURLSession> {
             onData: onData,
             onFinishedDownloading: onFinishedDownloading,
             onComplete: onComplete,
+            onMetrics: onMetrics,
             onWebSocketTaskOpened: onWebSocketTaskOpened,
             onWebSocketTaskClosed: onWebSocketTaskClosed,
           ),
@@ -1280,6 +1586,24 @@ class URLSession extends _ObjectHolder<ncb.NSURLSession> {
   /// See [NSURLSession finishTasksAndInvalidate](https://developer.apple.com/documentation/foundation/nsurlsession/1407428-finishtasksandinvalidate)
   void finishTasksAndInvalidate() {
     _nsObject.finishTasksAndInvalidate();
+  }
+
+  // LOCAL PATCH (generation 1): expose `invalidateAndCancel`.
+  //
+  // Upstream binds it in `native_cupertino_bindings.dart` but never surfaces it
+  // here, so `finishTasksAndInvalidate` — which drains — is the only teardown a
+  // caller can reach. Draining is wrong for us: see the note on
+  // `CupertinoClient.close()`. Purely additive; a candidate for upstreaming.
+  /// Cancel all outstanding tasks, then free resources related to this session.
+  /// Returns immediately.
+  ///
+  /// Unlike [finishTasksAndInvalidate], running tasks do **not** run to
+  /// completion — each fails with a cancellation error, so
+  /// [NSErrorExtension.isCancelled] is true for it.
+  ///
+  /// See [NSURLSession invalidateAndCancel](https://developer.apple.com/documentation/foundation/nsurlsession/1411538-invalidateandcancel)
+  void invalidateAndCancel() {
+    _nsObject.invalidateAndCancel();
   }
 }
 
