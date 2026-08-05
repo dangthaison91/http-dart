@@ -4,6 +4,7 @@
 
 import 'dart:async';
 import 'dart:io';
+import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:async/async.dart';
@@ -14,6 +15,38 @@ import 'package:objective_c/objective_c.dart';
 import 'cupertino_api.dart';
 
 final _digitRegex = RegExp(r'^\d+$');
+
+// LOCAL PATCH (generation 2): transport-metrics collection.
+//
+// A [CupertinoClient] sits *under* Dio, so it cannot see which Dio attempt a
+// request belongs to. Correlation is therefore an **input**: the consumer
+// supplies a resolver that derives the key from the request, and the fork only
+// carries that key through to the metrics record. When no resolver is set, or
+// it declines, the fork mints its own key so `taskDescription` is still
+// populated for native debugging — but such a record is *not* correlatable on
+// the Dio side. Choosing the channel a resolver reads from is a consumer
+// decision, deliberately not made here.
+
+/// Receives the metrics collected for one URLSession task.
+///
+/// [correlationKey] is the value that was written to
+/// [URLSessionTask.taskDescription] for the task that produced [metrics].
+typedef CupertinoMetricsSink =
+    void Function(String correlationKey, URLSessionTaskMetrics metrics);
+
+/// Derives the correlation key for [request], or returns `null` to let the fork
+/// mint one.
+typedef CupertinoMetricsKeyResolver = String? Function(BaseRequest request);
+
+/// Distinguishes keys minted by different runs of the process, so that a key is
+/// never reused across an app restart.
+final _metricsKeyNonce = Random().nextInt(1 << 32).toRadixString(16);
+int _metricsKeyCounter = 0;
+
+/// A namespaced fallback correlation key. The value must not collide
+/// with any other `taskDescription` writer.
+String _mintCorrelationKey() =>
+    'cupertino_http.metrics.$_metricsKeyNonce.${_metricsKeyCounter++}';
 
 /// A [ClientException] generated from an [NSError].
 class NSErrorClientException extends ClientException {
@@ -96,6 +129,31 @@ class CupertinoClient extends BaseClient {
   final _tasks = <int, Completer<void>>{};
 
   URLSession? _urlSession;
+
+  /// LOCAL PATCH (generation 2): set this to start collecting transport
+  /// metrics; leave it `null` to collect nothing.
+  ///
+  /// `null` — the default — means the metrics delegate is never attached, so
+  /// collection costs nothing. This is the entire kill switch:
+  /// the fork makes no per-request sampling decision. Once the sink is set,
+  /// every request is measured, and export volume is governed downstream.
+  ///
+  /// A mutable field rather than a constructor argument because the owner
+  /// builds the client for a shared transport pool and arms telemetry
+  /// separately, from a kill switch that can flip after construction. No new
+  /// adapter is involved (FR-005) — the owner already holds the client:
+  ///
+  /// ```dart
+  /// _apiSharedClientRaw = CupertinoClient.fromSessionConfiguration(config)
+  ///   ..onMetrics = sink
+  ///   ..metricsKeyResolver = resolver;
+  /// ```
+  CupertinoMetricsSink? onMetrics;
+
+  /// LOCAL PATCH (generation 2): supplies the correlation key for a request.
+  ///
+  /// See [CupertinoMetricsKeyResolver]. Ignored while [onMetrics] is `null`.
+  CupertinoMetricsKeyResolver? metricsKeyResolver;
 
   CupertinoClient._(this._urlSession);
 
@@ -330,6 +388,19 @@ class CupertinoClient extends BaseClient {
     Uri? lastRedirectUrl;
 
     final task = urlSession.dataTaskWithRequest(urlRequest);
+
+    // LOCAL PATCH (generation 2): arm metrics collection before `resume()`.
+    // `taskDescription` has to be written while the task is still suspended,
+    // and reading `onMetrics` once keeps a concurrent write to the field
+    // from arming the delegate but leaving the key unset.
+    final metricsSink = onMetrics;
+    final metricsKey = metricsSink == null
+        ? null
+        : metricsKeyResolver?.call(request) ?? _mintCorrelationKey();
+    if (metricsKey != null) {
+      task.taskDescription = metricsKey;
+    }
+
     final dataController = StreamController<Uint8List>(
       onCancel: () async {
         cancelled = true;
@@ -370,6 +441,11 @@ class CupertinoClient extends BaseClient {
           dataController.close();
           _tasks.remove(task.taskIdentifier)!.complete();
         },
+        // LOCAL PATCH (generation 2): attached only when a sink is set, so the
+        // default build pays nothing for the capability.
+        onMetrics: metricsSink == null || metricsKey == null
+            ? null
+            : (_, _, metrics) => metricsSink(metricsKey, metrics),
         onRedirect: (session, task, response, request) {
           numRedirects += 1;
           if (numRedirects > maxRedirects) {
