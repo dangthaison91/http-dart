@@ -200,12 +200,30 @@ class CupertinoClient extends BaseClient {
     return CupertinoClient._(session);
   }
 
+  // LOCAL PATCH (generation 1): cancel outstanding tasks instead of throwing.
+  //
+  // Upstream throws `StateError('cannot close with running requests')` when
+  // `_tasks` is not empty. That makes close() unusable at teardown: our shared
+  // transport pools are closed on logout, when requests are routinely still in
+  // flight. Catching the throw is not an option either — it happens *before*
+  // the invalidate, so the native session would leak for the life of the
+  // process, accumulating across login cycles.
+  //
+  // `invalidateAndCancel` is the right primitive: teardown must not block on
+  // the network, and retry ownership sits above transport (the send queue), so
+  // pending requests are cancelled rather than drained.
+  //
+  // With `_tasks` empty this is equivalent to the upstream
+  // `finishTasksAndInvalidate` — there is nothing to cancel.
+  //
+  // Cancelling is safe for pending callers: the session still delivers one
+  // completion per outstanding task after invalidation, each carrying
+  // `NSURLErrorCancelled`, which `send` maps to `RequestAbortedException`. The
+  // delegate closures capture `_tasks`, never `_urlSession`, so clearing the
+  // field below cannot strand them.
   @override
   void close() {
-    if (_tasks.isNotEmpty) {
-      throw StateError('cannot close with running requests');
-    }
-    _urlSession?.finishTasksAndInvalidate();
+    _urlSession?.invalidateAndCancel();
     _urlSession = null;
   }
 
