@@ -13,6 +13,32 @@ import 'jni/jni_bindings.dart' as jb;
 final _digitRegex = RegExp(r'^\d+$');
 const _bufferSize = 10 * 1024; // The size of the Cronet read buffer.
 
+/// LOCAL PATCH (JNI global ref leak) — holder cho JNI global ref của
+/// `UrlRequest`/`CronetUrlRequest`. Upstream chỉ neo ref sống qua
+/// `abortTrigger.whenComplete(...cancel)` và trông chờ GC thu hồi → dưới tải
+/// request cao, bảng JNI global ref (51200) tràn trước khi GC kịp →
+/// `SIGABRT: global reference table overflow`. Holder này release ref
+/// deterministic ngay tại terminal callback (succeeded/failed/canceled).
+/// [cancel] wired vào `abortTrigger`, no-op sau khi đã release. Xem PATCH.md.
+class _CronetRequestHandle {
+  jb.UrlRequest? _request;
+  var _released = false;
+
+  void attach(jb.UrlRequest request) => _request = request;
+
+  void cancel() {
+    if (_released) return;
+    _request?.cancel();
+  }
+
+  void release() {
+    if (_released) return;
+    _released = true;
+    _request?.release();
+    _request = null;
+  }
+}
+
 /// This class can be removed when `package:http` v2 is released.
 class _StreamedResponseWithUrl extends StreamedResponse
     implements BaseResponseWithUrl {
@@ -116,6 +142,11 @@ class CronetEngine {
   /// should be used per [CronetEngine].
   ///
   /// [userAgent] controls the `User-Agent` header.
+  ///
+  /// [quicHints] adds danh sách host được biết là hỗ trợ QUIC. Mỗi hint là
+  /// tuple `(host, port, alternativePort)`; Cronet sẽ thử QUIC ngay từ request
+  /// đầu tới host đó thay vì chờ `Alt-Svc`. (LOCAL PATCH: port từ cronet_http
+  /// 1.8.0; binding `addQuicHint` đã có sẵn trong 1.6.0.)
   static CronetEngine build(
       {CacheMode? cacheMode,
       int? cacheMaxSize,
@@ -124,7 +155,8 @@ class CronetEngine {
       bool? enablePublicKeyPinningBypassForLocalTrustAnchors,
       bool? enableQuic,
       String? storagePath,
-      String? userAgent}) {
+      String? userAgent,
+      List<(String, int, int)>? quicHints}) {
     final builder = jb.CronetEngine$Builder(
         JObject.fromReference(Jni.getCachedApplicationContext()));
 
@@ -154,6 +186,13 @@ class CronetEngine {
 
       if (enableQuic != null) {
         builder.enableQuic(enableQuic);
+      }
+
+      // LOCAL PATCH: port quicHints từ 1.8.0 (binding addQuicHint có sẵn ở 1.6.0).
+      if (quicHints != null) {
+        for (final (host, port, alternativePort) in quicHints) {
+          builder.addQuicHint(host.toJString(), port, alternativePort);
+        }
       }
 
       if (userAgent != null) {
@@ -191,7 +230,8 @@ Map<String, String> _cronetToClientHeaders(
 jb.UrlRequestCallbackProxy$UrlRequestCallbackInterface _urlRequestCallbacks(
     BaseRequest request,
     Completer<CronetStreamedResponse> responseCompleter,
-    HttpClientRequestProfile? profile) {
+    HttpClientRequestProfile? profile,
+    _CronetRequestHandle requestHandle) { // LOCAL PATCH
   StreamController<List<int>>? responseStream;
   JByteBuffer? jByteBuffer;
   var numRedirects = 0;
@@ -323,6 +363,7 @@ jb.UrlRequestCallbackProxy$UrlRequestCallbackInterface _urlRequestCallbacks(
       responseStream!.sink.close();
       jByteBuffer?.release();
       profile?.responseData.close();
+      requestHandle.release(); // LOCAL PATCH
     },
     onFailed: (urlRequest, responseInfo /* can be null */, cronetException) {
       if (responseStreamCancelled) return;
@@ -344,6 +385,7 @@ jb.UrlRequestCallbackProxy$UrlRequestCallbackInterface _urlRequestCallbacks(
         }
       }
       jByteBuffer?.release();
+      requestHandle.release(); // LOCAL PATCH
     },
     // Will always be the last callback invoked.
     // See https://developer.android.com/develop/connectivity/cronet/reference/org/chromium/net/UrlRequest#cancel()
@@ -367,6 +409,7 @@ jb.UrlRequestCallbackProxy$UrlRequestCallbackInterface _urlRequestCallbacks(
         }
       }
       jByteBuffer?.release();
+      requestHandle.release(); // LOCAL PATCH
     },
   ));
 }
@@ -464,11 +507,13 @@ class CronetClient extends BaseClient {
     profile?.requestData.bodySink.add(body);
 
     final responseCompleter = Completer<CronetStreamedResponse>();
+    final requestHandle = _CronetRequestHandle(); // LOCAL PATCH
 
     final builder = engine._engine.newUrlRequestBuilder(
       request.url.toString().toJString(),
       jb.UrlRequestCallbackProxy(
-          _urlRequestCallbacks(request, responseCompleter, profile)),
+          _urlRequestCallbacks(request, responseCompleter, profile,
+              requestHandle)), // LOCAL PATCH
       _executor,
     )!
       ..setHttpMethod(request.method.toJString());
@@ -502,8 +547,10 @@ class CronetClient extends BaseClient {
     }
 
     final cronetRequest = builder.build()!;
+    requestHandle.attach(cronetRequest); // LOCAL PATCH
     if (request case Abortable(:final abortTrigger?)) {
-      unawaited(abortTrigger.whenComplete(cronetRequest.cancel));
+      // LOCAL PATCH: route qua requestHandle.cancel để an toàn với ref đã release.
+      unawaited(abortTrigger.whenComplete(requestHandle.cancel));
     }
     cronetRequest.start();
     return responseCompleter.future;
