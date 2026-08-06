@@ -285,3 +285,42 @@ Upstream 1.9.0 (jni 1.0.0) vẫn nguyên pattern — bump version không tự kh
 Re-apply 5 vị trí trên (grep `LOCAL PATCH (v2)`); nếu upstream đổi
 codegen (jni ≥1.0 vẫn cùng shape `_$impls`/RawReceivePort tính đến 1.9.0), map
 tương ứng theo block class của interface.
+
+---
+
+# Patch AN-1 (upload-ref) — release JNI global ref của upload provider + body buffer
+
+## Vấn đề
+
+Heap-diff (Pixel 8, UAT, 54 lần gửi) cho thấy mỗi POST có body làm leak các class
+Cronet đồng loạt: `CronetUploadDataStream +938`, `DirectByteBuffer +1586`,
+`CronetUrlRequest +945`, `CronetMetrics +945`. Trong `send()`, nhánh upload tạo
+`data = body.toJByteBuffer()` (JNI global ref #1) rồi
+`builder.setUploadDataProvider(jb.UploadDataProviders.create$2(data), _executor)`
+(ref #2, tạo inline, không giữ, không release). v1 chỉ release `UrlRequest`, v2
+release thêm response `jByteBuffer` + detach registry — nhưng **cả hai không đụng
+2 ref phía upload** → provider ghim trọn request graph → leak mỗi lần gửi.
+
+## Bản vá (tìm theo comment `LOCAL PATCH`; không có tag v2)
+
+`lib/src/cronet_client.dart`:
+- `_CronetRequestHandle`: thêm `JObject? _uploadProvider` + `JByteBuffer? _uploadData`
+  và `attachUpload(provider, data)`; trong `release()` (sau `_request?.release()`)
+  release + null hoá 2 ref này. `cancel()` KHÔNG đụng — chỉ terminal `release()` nhả.
+- `send()` nhánh `if (body.isNotEmpty)`: bắt `final uploadProvider =
+  jb.UploadDataProviders.create$2(data)!` (create$2 trả `JObject?`),
+  `requestHandle.attachUpload(uploadProvider, data)`, rồi truyền CHÍNH object đó
+  vào `setUploadDataProvider` (không gọi `create$2` lần hai).
+
+## Compose với v2 (không sửa dòng v2)
+
+`cleanupTerminal()` đã gọi `requestHandle.release()` ở MỌI đường terminal
+(onSucceeded/onFailed/onCanceled) → 2 ref upload nhả sau khi Cronet đọc xong body
+(an toàn). Nhánh `catch` fail đồng bộ cũng gọi `requestHandle.release()` → an toàn
+(request chưa chạy). KHÔNG release trong `finally` (chạy ngay sau `start()`, Cronet
+còn đang đọc body → use-after-free). GET/no-body: 2 field null → `release()` no-op.
+
+## Khi bump version
+
+Re-apply 2 chỗ trên (grep `LOCAL PATCH`, phần `_uploadProvider`/`attachUpload`/
+`uploadProvider`); giữ release ở terminal (`release()`), không đưa vào `finally`.

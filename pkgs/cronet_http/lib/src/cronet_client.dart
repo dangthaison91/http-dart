@@ -22,9 +22,18 @@ const _bufferSize = 10 * 1024; // The size of the Cronet read buffer.
 /// [cancel] wired vào `abortTrigger`, no-op sau khi đã release. Xem PATCH.md.
 class _CronetRequestHandle {
   jb.UrlRequest? _request;
+  JObject? _uploadProvider; // LOCAL PATCH (org.chromium.net.UploadDataProvider)
+  JByteBuffer? _uploadData; // LOCAL PATCH
   var _released = false;
 
   void attach(jb.UrlRequest request) => _request = request;
+
+  // LOCAL PATCH: giữ provider + buffer của body upload để release() nhả ở
+  // terminal như _request; không thì mỗi lần gửi có body là leak.
+  void attachUpload(JObject provider, JByteBuffer data) {
+    _uploadProvider = provider;
+    _uploadData = data;
+  }
 
   void cancel() {
     if (_released) return;
@@ -36,6 +45,10 @@ class _CronetRequestHandle {
     _released = true;
     _request?.release();
     _request = null;
+    _uploadProvider?.release(); // LOCAL PATCH
+    _uploadProvider = null; // LOCAL PATCH
+    _uploadData?.release(); // LOCAL PATCH
+    _uploadData = null; // LOCAL PATCH
   }
 }
 
@@ -598,8 +611,11 @@ class CronetClient extends BaseClient {
           rethrow;
         }
 
-        builder.setUploadDataProvider(
-            jb.UploadDataProviders.create$2(data), _executor);
+        // LOCAL PATCH: giữ ref provider (create$2 trả nullable) trong handle
+        // để terminal release() nhả; bản gốc tạo inline nên mất ref → leak.
+        final uploadProvider = jb.UploadDataProviders.create$2(data)!;
+        requestHandle.attachUpload(uploadProvider, data); // LOCAL PATCH
+        builder.setUploadDataProvider(uploadProvider, _executor); // LOCAL PATCH
       }
 
       final cronetRequest = builder.build()!;
