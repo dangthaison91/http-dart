@@ -300,6 +300,30 @@ class UrlRequestCallbackProxy$UrlRequestCallbackInterface
   static final core$_
       .Map<int, $UrlRequestCallbackProxy$UrlRequestCallbackInterface>
       _$impls = {};
+
+  // LOCAL PATCH (v2): song song với _$impls, giữ RawReceivePort theo
+  // port để có thể detach deterministic tại terminal callback. Không có patch
+  // này, entry _$impls + port chỉ được gỡ khi ART GC thu Java proxy (PortCleaner
+  // gửi null) — trong phiên chạy thực tế gần như không bao giờ xảy ra → leak
+  // trọn request graph theo mỗi request (xem PATCH.md §Patch v2).
+  static final core$_.Map<int, jni$_.RawReceivePort> _$ports = {};
+
+  // LOCAL PATCH (v2): gỡ impl khỏi registry + đóng port đúng 1 lần.
+  // Idempotent; an toàn gọi ngay trong chính callback đang chạy (dispatcher đã
+  // đọc _$impls[$p] trước khi invoke). Message null đến muộn từ PortCleaner chỉ
+  // là no-op (remove key vắng + close port đã đóng đều vô hại).
+  static void detachImpl(
+    $UrlRequestCallbackProxy$UrlRequestCallbackInterface impl,
+  ) {
+    int? port;
+    _$impls.forEach((k, v) {
+      if (core$_.identical(v, impl)) port = k;
+    });
+    if (port != null) {
+      _$impls.remove(port);
+      _$ports.remove(port)?.close();
+    }
+  }
   static jni$_.JObjectPtr _$invoke(
     int port,
     jni$_.JObjectPtr descriptor,
@@ -393,6 +417,7 @@ class UrlRequestCallbackProxy$UrlRequestCallbackInterface
     $p = jni$_.RawReceivePort(($m) {
       if ($m == null) {
         _$impls.remove($p.sendPort.nativePort);
+        _$ports.remove($p.sendPort.nativePort); // LOCAL PATCH (v2)
         $p.close();
         return;
       }
@@ -421,6 +446,7 @@ class UrlRequestCallbackProxy$UrlRequestCallbackInterface
     );
     final $a = $p.sendPort.nativePort;
     _$impls[$a] = $impl;
+    _$ports[$a] = $p; // LOCAL PATCH (v2)
   }
 
   factory UrlRequestCallbackProxy$UrlRequestCallbackInterface.implement(

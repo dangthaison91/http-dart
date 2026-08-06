@@ -232,3 +232,56 @@ Khi `native_dio_adapter`/`cronet_http` có bản release chính thức xử lý 
 Nếu upstream phát hành bản fix leak này, có thể xoá `packages/cronet_http` và
 bỏ `dependency_overrides: cronet_http` trong `pubspec.yaml` (workspace root). Khi
 bump cronet_http version khác, re-apply 3 chỗ `LOCAL PATCH` lên source mới.
+
+---
+
+# Patch v2 — detach proxy registry `_$impls` tại terminal callback
+
+## Vấn đề
+
+Patch v1 release JNI global ref của `CronetUrlRequest` (hết crash overflow tức
+thời) nhưng KHÔNG đụng registry phía Dart của callback proxy: mỗi request,
+generated `jni_bindings.dart` đăng ký impl vào **static map `_$impls`** và mở
+một **`RawReceivePort`** (cả hai là GC root). Entry chỉ được gỡ khi ART GC thu
+Java proxy → `PortCleaner` (jni) gửi message `null` về port. Chuỗi dọn =
+Dart-GC-finalizer → ART GC → port message: thực tế không chạy trong phiên →
+**mỗi request leak vĩnh viễn trọn graph**: impl + 6 closures (capture
+`responseCompleter`→`CronetStreamedResponse`, `UrlRequest` wrapper,
+`JByteBuffer` 10KB direct, `_CronetRequestHandle`, `StreamController`) và — qua
+`responseCompleter.future._zone` → custom Zone per-request của dio
+(`createInterceptorZone`) — cả `InterceptorState`/`RequestOptions`/`Response`
+của dio. Đã device-verify bằng VM Service `getRetainingPath` (report:
+`$SPECS_ROOT/agent-docs/reports/chat/thread-open-transition-jank-by-leak-ram/`).
+Upstream 1.9.0 (jni 1.0.0) vẫn nguyên pattern — bump version không tự khỏi.
+
+## Bản vá (tìm theo comment `LOCAL PATCH (v2)`)
+
+`lib/src/jni/jni_bindings.dart` — block `UrlRequestCallbackProxy$UrlRequestCallbackInterface`:
+1. Thêm static map `_$ports: Map<int, RawReceivePort>` song song `_$impls`.
+2. `implementIn`: đăng ký `_$ports[$a] = $p;` + nhánh null-message remove cả `_$ports`.
+3. Thêm static `detachImpl(impl)`: tìm port theo `identical`, remove 2 map +
+   `port.close()`. Idempotent; null-message của PortCleaner đến muộn = no-op.
+
+`lib/src/cronet_client.dart`:
+4. `_urlRequestCallbacks`: tách `impl` ra biến `late final`, helper `detach()`;
+   gọi `detach()` ngay sau `requestHandle.release()` ở CẢ 3 terminal callback
+   (`onSucceeded`/`onFailed`/`onCanceled` — Cronet đảm bảo đúng một terminal,
+   không callback nào sau đó). Return type đổi thành record
+   `(interfaceWrapper, detachFn)` để `send()` dọn được khi fail đồng bộ.
+5. `send()`: bọc builder→`start()` trong try/catch/finally —
+   catch (sync-throw, terminal callback sẽ không bao giờ bắn):
+   `requestHandle.release()` + `detachCallbacks()` + rethrow;
+   finally: `.release()` 2 Dart wrapper (`UrlRequestCallbackProxy` + interface)
+   — Java builder/UrlRequest đã giữ ref riêng, nhả sớm để ART GC không bị ghim.
+
+## Bất biến
+
+- Không đổi hành vi HTTP: redirect/read/cancel/abort giữ nguyên; detach chỉ chạy
+  sau terminal (hoặc sync-fail), khi Cronet đã cam kết không callback nữa.
+- PortCleaner backstop giữ nguyên cho mọi đường sót (double remove/close vô hại).
+
+## Khi bump version
+
+Re-apply 5 vị trí trên (grep `LOCAL PATCH (v2)`); nếu upstream đổi
+codegen (jni ≥1.0 vẫn cùng shape `_$impls`/RawReceivePort tính đến 1.9.0), map
+tương ứng theo block class của interface.
