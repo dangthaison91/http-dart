@@ -1,3 +1,22 @@
+> ## A patched fork of `dart-lang/http`
+>
+> It carries fixes I needed in production before upstream could take them.
+> **This branch (`master`) is stock upstream and has none of them** — they live on
+> long-lived patch branches, consumed as git dependencies pinned by commit SHA:
+>
+> | Package | Branch | What it adds |
+> |---|---|---|
+> | `cupertino_http` | [`patch/cupertino_http-3.0.2`](https://github.com/dangthaison91/http-dart/tree/patch/cupertino_http-3.0.2) | `close()` cancels in-flight tasks instead of throwing; an optional per-request URLSession transaction metrics sink (DNS / TCP / TLS / time-to-first-byte) |
+> | `cronet_http` | [`patch/cronet_http-1.6.0`](https://github.com/dangthaison91/http-dart/tree/patch/cronet_http-1.6.0) | releases the leaked JNI global references that overflowed the reference table and aborted the app; back-ports `quicHints` from 1.8.0 |
+>
+> **Read [FORK.md](FORK.md)** before changing anything here — the patch branches must
+> never be rewritten, because their commit SHAs are pinned by dependent builds. Each
+> package's `PATCH.md`, on its own branch, is that package's changelog.
+>
+> Everything below this line is upstream's own README.
+
+---
+
 [![Build Status](https://github.com/dart-lang/http/workflows/Dart%20CI/badge.svg)](https://github.com/dart-lang/http/actions?query=workflow%3A"Dart+CI"+branch%3Amaster)
 
 A composable, Future-based library for making HTTP requests.
