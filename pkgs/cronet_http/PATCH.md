@@ -1,16 +1,45 @@
-# cronet_http 1.6.0 — LOCAL PATCH (JNI global ref leak + quicHints)
+# cronet_http 1.6.0 — patches (JNI global ref leak + quicHints)
 
-Bản vendored từ `cronet_http` **1.6.0** (pub.dev) + bản vá, dùng qua
-`dependency_overrides` trong `pubspec.yaml` ở **workspace root**.
-Override ở root phủ **toàn bộ** workspace, gồm cả `app` lẫn another workspace package
-(dùng cronet_http qua `NativeHttpAdapterFactory`) — nên không cần sửa source chúng.
+Bản vá trên nền `cronet_http` **1.6.0**, giữ trên nhánh `patch/cronet_http-1.6.0`.
+Dùng qua `dependency_overrides` (git hoặc path) ở **workspace root**, nên override
+phủ toàn bộ workspace và không cần sửa source của từng package.
+
+Tìm mọi thay đổi viết tay bằng comment `LOCAL PATCH`.
+
+## Changelog
+
+Mới nhất ở trên, mỗi generation một mục. Chi tiết kỹ thuật ở phần tương ứng bên dưới.
+
+### AN-1 — giải phóng JNI ref của upload provider · 2026-08-06
+
+Đường upload giữ JNI global ref của `uploadProvider` và body buffer mà không release,
+nên mỗi request có body vẫn rò ref kể cả sau khi v1 đã vá 3 terminal callback.
+Release chúng tại terminal, không đặt trong `finally`.
+
+### v2 — detach callback proxy · 2026-08-06
+
+Proxy của callback vẫn nằm lại trong registry `_$impls` sau khi request kết thúc, kéo
+theo một `RawReceivePort` sống mãi cho mỗi request: entry chỉ được gỡ khi ART GC thu
+Java proxy, việc gần như không xảy ra trong một phiên chạy thực tế. Đóng port và gỡ
+entry ngay tại terminal callback, idempotent.
+
+### v1 — release JNI global ref tại 3 terminal callback, và port `quicHints` · 2026-08-06
+
+`CronetUrlRequest` không được release ở bất kỳ terminal callback nào, nên JNI global
+reference table đầy dần rồi app abort:
+`SIGABRT: JNI ERROR (app bug): global reference table overflow (max=51200)`.
+Thêm một class holder giữ ref và release nó ở cả ba callback kết thúc
+(succeeded / failed / canceled).
+
+Cùng commit port tham số `quicHints` của `CronetEngine.build()` từ 1.8.0 về — binding
+`addQuicHint` vốn đã có sẵn trong `jni_bindings.dart` của 1.6.0.
 
 ## ⚠️ Vì sao 1.6.0 (không phải 1.8.0)
 
 Trước đây vendored 1.8.0 (jni `^0.15.2`). Khi tích hợp Datadog, `datadog_flutter_plugin`
 3.x yêu cầu `jni ^0.14.2` (`<0.15.0`) → xung đột cứng với cronet 1.7.0+ (jni `^0.15.2`).
 Hạ về **1.6.0** (jni `^0.14.2`) để khớp Datadog. Bản 1.6.0 thiếu tham số `quicHints`
-ở `CronetEngine.build()` (that package cần) — nhưng binding `addQuicHint` ĐÃ có sẵn
+ở `CronetEngine.build()` — nhưng binding `addQuicHint` ĐÃ có sẵn
 trong `jni_bindings.dart` của 1.6.0, nên đã **port tham số `quicHints` từ 1.8.0** vào
 `build()` (đánh dấu `LOCAL PATCH`). Kết quả: jni 0.14.2 (Datadog OK) + fix leak + quicHints.
 
@@ -229,9 +258,12 @@ Khi `native_dio_adapter`/`cronet_http` có bản release chính thức xử lý 
 
 ## Khi nâng cấp / gỡ
 
-Nếu upstream phát hành bản fix leak này, có thể xoá `packages/cronet_http` và
-bỏ `dependency_overrides: cronet_http` trong `pubspec.yaml` (workspace root). Khi
-bump cronet_http version khác, re-apply 3 chỗ `LOCAL PATCH` lên source mới.
+Nếu upstream phát hành bản fix leak này, chỉ cần bỏ `dependency_overrides:
+cronet_http` — quay về bản trên pub.dev.
+
+Khi bump lên upstream version khác: cắt **nhánh mới** từ release commit của version
+đó (`patch/cronet_http-<version>`) rồi re-apply 3 chỗ `LOCAL PATCH` lên source mới.
+Không rebase nhánh này lên upstream mới — commit ở đây đang được pin theo SHA.
 
 ---
 
