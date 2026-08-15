@@ -1,8 +1,9 @@
 # cupertino_http 3.0.2 — patches
 
-Two changes on top of the stock `cupertino_http` 3.0.2 release, kept on the branch
-`patch/cupertino_http-3.0.2`. Both are opt-in: a client that passes no new argument
-behaves exactly as upstream does.
+Three changes on top of the stock `cupertino_http` 3.0.2 release, kept on the branch
+`patch/cupertino_http-3.0.2`. The first two are opt-in: a client that passes no new
+argument behaves exactly as upstream does. Generation 3 is a lifecycle-safety fix
+that applies to every client.
 
 Every hand-written change carries a `LOCAL PATCH` comment. The one thing that marker
 cannot cover is the regenerated `native_cupertino_bindings.dart` — machine-generated
@@ -12,6 +13,18 @@ include lines.
 ## Changelog
 
 Newest first, one entry per generation.
+
+### Generation 3 — isolate-safe Objective-C listeners · 2026-08-15
+
+Generated listener blocks invoked Dart FFI callbacks directly. If a URLSession
+delegate callback arrived after the owning isolate shut down, the Dart VM aborted
+with `Callback invoked after it has been deleted.`
+
+Updated `package:objective_c` to 9.5.0 and `package:ffigen` to 21.0.0, then
+regenerated the bindings. Listener blocks now dispatch through
+`DOBJC_invokeListenerPortBlock`, which safely drops callbacks whose receive port no
+longer exists. Added the upstream isolate-shutdown regression test from
+dart-lang/http#1975.
 
 ### Generation 2 — per-request URLSession metrics · 2026-08-05
 
@@ -42,7 +55,8 @@ error. It now cancels the in-flight tasks instead, so closing is safe at any mom
 
 ## What is patched
 
-The tree is stock 3.0.2 apart from the changes above; `pubspec.yaml` is untouched.
+The tree is stock 3.0.2 apart from the changes above. Generation 3 updates only the
+`objective_c` runtime and `ffigen` generator constraints in `pubspec.yaml`.
 Check the delta at any time, from a checkout of this branch:
 
 ```bash
@@ -52,11 +66,10 @@ git diff ab3d00d..HEAD -- pkgs/cupertino_http     # ab3d00d = the 3.0.2 release 
 Expect `PATCH.md` plus one hunk per `LOCAL PATCH` site, and the regenerated bindings.
 **A hunk you cannot name is a bug** — resolve it before upgrading.
 
-The upstream `pubspec.yaml` needs **no edit** when this package is consumed as a git
-or path dependency, even though it declares `path:` dev-dependencies into this
+The upstream `pubspec.yaml` otherwise needs no edit when this package is consumed as
+a git or path dependency, even though it declares `path:` dev-dependencies into this
 monorepo and its own `dependency_overrides`. Pub honours neither for a dependency —
 only the root or workspace package's dev-dependencies and overrides are resolved.
-Keeping the pubspec stock is what keeps the diff above clean, so **do not "fix" it**.
 
 ## Build shape — a code-assets package, not a Flutter plugin
 
